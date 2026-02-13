@@ -4,6 +4,7 @@ import os
 import subprocess
 # import whisper
 import cv2
+import sys
 import numpy as np
 
 # -----------------------------
@@ -26,99 +27,116 @@ MAX_GAPS_BETWEEN_BOUNDARIES = 5  # Max gap in seconds between 2 consecutive
                                  # blank slide frames
 
 
-# -----------------------------
-# 1. Detect blank slides
-# -----------------------------
+def cut(sys):
+    """docstring for cut"""
+    if sys == "Linux":
+        lcrop = 0.218
+        rcrop = 0.898
+        tcrop = 0.169
+        bcrop = 0.981
+    else:
+        lcrop = 0.13
+        rcrop = 0.73
+        tcrop = 0.13
+        bcrop = 1
+    # -----------------------------
+    # 1. Detect blank slides
+    # -----------------------------
+    print("Detecting blank slides...")
+    cap = cv2.VideoCapture(VIDEO_PATH)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
-print("Detecting blank slides...")
-cap = cv2.VideoCapture(VIDEO_PATH)
-fps = cap.get(cv2.CAP_PROP_FPS)
-frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    visual_boundaries = [0.0]
+    frame_step = int(fps * FRAME_INTERVAL)
 
-visual_boundaries = [0.0]
-frame_step = int(fps * FRAME_INTERVAL)
+    print("framestep: ", frame_step)
 
-print("framestep: ", frame_step)
+    print("Getting boundaries")
 
-print("Getting boundaries")
+    last = 0.0
 
-last = 0.0
+    for i in range(0, frame_count, frame_step):
+        cap.set(cv2.CAP_PROP_POS_FRAMES, i)
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        h, w = gray.shape
+        # Windows Panopto
+        left_crop = int(w * lcrop)   # crop 13% from left
+        right_crop = int(w * rcrop)  # crop 27% from right to ignore the webcam
+        top_crop = int(h * tcrop)    # crop 13% from the top
+        bottom_crop = int(h * bcrop)
+        # Linux OBS
+        # left_crop = int(w * 0.218)
+        # right_crop = int(w * 0.898)
+        # top_crop = int(h * 0.169)
+        # bottom_crop = int(h * 0.981)
+        roi = gray[top_crop:bottom_crop, left_crop:right_crop]  # keep center region only
+        variance = np.var(roi)
+        last = i / fps
+        # print(i, last, variance)
+        if variance < BLANK_VARIANCE_THRESHOLD:  # likely blank slide
+            timestamp = last
+            visual_boundaries.append(timestamp)
+            print(i, timestamp, variance)
+    print("Boundaries: ", visual_boundaries)
 
-for i in range(0, frame_count, frame_step):
-    cap.set(cv2.CAP_PROP_POS_FRAMES, i)
-    ret, frame = cap.read()
-    if not ret:
-        break
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    h, w = gray.shape
-    # Windows Panopto
-    left_crop = int(w * 0.13)   # crop 13% from left
-    right_crop = int(w * 0.73)  # crop 27% from right to ignore the webcam
-    top_crop = int(h * 0.13)    # crop 13% from the top
-    bottom_crop = h
-    # Linux OBS
-    # left_crop = int(w * 0.218)
-    # right_crop = int(w * 0.898)
-    # top_crop = int(h * 0.169)
-    # bottom_crop = int(h * 0.981)
-    roi = gray[top_crop:bottom_crop, left_crop:right_crop]  # keep center region only
-    variance = np.var(roi)
-    last = i / fps
-    # print(i, last, variance)
-    if variance < BLANK_VARIANCE_THRESHOLD:  # likely blank slide
-        timestamp = last
-        visual_boundaries.append(timestamp)
-        print(i, timestamp, variance)
-print("Boundaries: ", visual_boundaries)
+    # Add the last timestamp to get the last section
+    visual_boundaries.append(last)
 
-# Add the last timestamp to get the last section
-visual_boundaries.append(last)
+    cap.release()
 
-cap.release()
+    # -----------------------------
+    # 2. Merge nearby boundaries
+    # -----------------------------
 
-# -----------------------------
-# 2. Merge nearby boundaries
-# -----------------------------
+    # Sort visual boundaries
+    # visual_boundaries.sort()
 
-# Sort visual boundaries
-# visual_boundaries.sort()
-
-# Merge consecutive timestamps within a gap
-merged_visual_boundaries = []
-if visual_boundaries:
-    current = visual_boundaries[0]
-    for ts in visual_boundaries[1:]:
-        if ts - current > MAX_GAPS_BETWEEN_BOUNDARIES:  # gap threshold in seconds
-            merged_visual_boundaries.append(current)
-            current = ts
-    merged_visual_boundaries.append(current)
-else:
+    # Merge consecutive timestamps within a gap
     merged_visual_boundaries = []
+    if visual_boundaries:
+        current = visual_boundaries[0]
+        for ts in visual_boundaries[1:]:
+            if ts - current > MAX_GAPS_BETWEEN_BOUNDARIES:  # gap threshold in seconds
+                merged_visual_boundaries.append(current)
+                current = ts
+        merged_visual_boundaries.append(current)
+    else:
+        merged_visual_boundaries = []
 
-# Replace visual_boundaries with merged version
-visual_boundaries = merged_visual_boundaries
-print("Merged boundaries: ", visual_boundaries)
+    # Replace visual_boundaries with merged version
+    visual_boundaries = merged_visual_boundaries
+    print("Merged boundaries: ", visual_boundaries)
 
-# -----------------------------
-# 3. Cut video into sections
-# -----------------------------
-print("Cutting video into sections...")
-section_files = []
-for idx in range(len(visual_boundaries) - 1):
-    start = visual_boundaries[idx]
-    end = visual_boundaries[idx + 1]
-    output_file = os.path.join(OUTPUT_DIR, f"section_{idx+1}.mp4")
-    cmd = [
-        "ffmpeg",
-        "-i", VIDEO_PATH,
-        "-ss", str(start),
-        "-to", str(end),
-        "-c", "copy",
-        output_file
-    ]
-    subprocess.run(cmd)
-    section_files.append(output_file)
+    # -----------------------------
+    # 3. Cut video into sections
+    # -----------------------------
+    print("Cutting video into sections...")
+    section_files = []
+    for idx in range(len(visual_boundaries) - 1):
+        start = visual_boundaries[idx]
+        end = visual_boundaries[idx + 1]
+        output_file = os.path.join(OUTPUT_DIR, f"section_{idx+1}.mp4")
+        cmd = [
+            "ffmpeg",
+            "-i", VIDEO_PATH,
+            "-ss", str(start),
+            "-to", str(end),
+            "-c", "copy",
+            output_file
+        ]
+        subprocess.run(cmd)
+        section_files.append(output_file)
 
+if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print("Usage: video.py <Linux|Windows>")
+        sys.exit(1)
+
+    cut(sys.argv[1])
 
 # # -----------------------------
 # # 4. Remove silence (jump cuts) in each section
